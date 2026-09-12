@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSD1306 128x64 Simulator</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #151b23;
+    --panel-2: #1b232d;
+    --line: #2a3340;
+    --text: #dce3ec;
+    --muted: #8b97a8;
+    --accent: #4ec3ff;
+    --accent-dim: #1e5b7d;
+    --danger: #ff6b6b;
+    --ok: #5ddb92;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 12px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header h1 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 650;
+    letter-spacing: 0.2px;
+    white-space: nowrap;
+  }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  .spacer { flex: 1; }
+
+  main {
+    display: grid;
+    /* The right column has to fit the panel at its default 5x zoom
+       (128*5 + bezel = 668px) or the card's overflow clips the display. */
+    grid-template-columns: minmax(0, 1fr) minmax(0, 700px);
+    gap: 16px;
+    padding: 16px 20px 40px;
+    align-items: start;
+  }
+  @media (max-width: 1240px) {
+    main { grid-template-columns: minmax(0, 1fr); }
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .card + .card { margin-top: 16px; }
+  .card h2 {
+    margin: 0;
+    padding: 10px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .card h2 .right { margin-left: auto; font-weight: 400; text-transform: none; letter-spacing: 0; }
+
+  /* --- controls --- */
+  button, select, input[type=file]::file-selector-button {
+    font: inherit;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled), select:hover { border-color: #3d4a5c; background: #212b37; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.primary { background: var(--accent-dim); border-color: #2b7ba5; color: #eaf7ff; }
+  button.primary:hover:not(:disabled) { background: #266d94; }
+  select { padding-right: 26px; }
+  label.check {
+    display: inline-flex; align-items: center; gap: 6px;
+    color: var(--muted); cursor: pointer; user-select: none; white-space: nowrap;
+  }
+  input[type=range] { accent-color: var(--accent); width: 100%; }
+  input[type=checkbox] { accent-color: var(--accent); }
+
+  /* --- editor --- */
+  .editor-wrap {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    background: #0f141b;
+    max-height: 60vh;
+    overflow: auto;
+  }
+  .gutter {
+    padding: 12px 8px 12px 12px;
+    text-align: right;
+    font: 12px/1.55 var(--mono);
+    color: #4b5769;
+    user-select: none;
+    background: #0c1117;
+    border-right: 1px solid var(--line);
+    white-space: pre;
+  }
+  .gutter .err { color: var(--danger); font-weight: 700; }
+  #code {
+    font: 12px/1.55 var(--mono);
+    padding: 12px;
+    border: 0;
+    outline: none;
+    resize: none;
+    background: transparent;
+    color: #cfd8e3;
+    white-space: pre;
+    overflow: hidden;
+    min-height: 380px;
+    tab-size: 2;
+  }
+
+  #error {
+    display: none;
+    margin: 0;
+    padding: 10px 14px;
+    background: #2a1518;
+    border-top: 1px solid #5a2a30;
+    color: #ffb4b4;
+    font: 12px/1.6 var(--mono);
+    white-space: pre-wrap;
+  }
+  #error.show { display: block; }
+  #error b { color: #ff8f8f; }
+
+  /* --- display --- */
+  .stage {
+    display: flex;
+    justify-content: center;
+    padding: 20px 14px;
+    /* Zoom levels past what the column can hold scroll rather than crop. */
+    overflow: auto;
+    background:
+      radial-gradient(ellipse at 50% 40%, #1a2430 0%, #0c1016 70%);
+  }
+  .stage > canvas { flex: none; }
+  canvas { display: block; border-radius: 8px; }
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    padding: 10px 14px;
+    border-top: 1px solid var(--line);
+  }
+  .controls .grp { display: flex; gap: 6px; align-items: center; }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border-top: 1px solid var(--line);
+  }
+  .stat { background: var(--panel); padding: 8px 12px; }
+  .stat .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
+  .stat .v { font: 14px/1.4 var(--mono); }
+  .stat .v.warn { color: #ffcc66; }
+
+  /* --- serial + io --- */
+  #serial {
+    margin: 0;
+    padding: 10px 14px;
+    font: 12px/1.6 var(--mono);
+    color: #b9c6d6;
+    height: 150px;
+    overflow: auto;
+    white-space: pre-wrap;
+    background: #0f141b;
+  }
+  #serial .t { color: #5d6b7e; }
+  #serial .empty { color: var(--muted); font-style: italic; }
+
+  .io-row {
+    display: grid;
+    grid-template-columns: 92px minmax(0, 1fr) 58px;
+    gap: 10px;
+    align-items: center;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .io-row:last-child { border-bottom: 0; }
+  .io-row .name { font: 12px var(--mono); color: var(--muted); }
+  .io-row .val { font: 12px var(--mono); text-align: right; }
+  .io-empty { padding: 12px 14px; color: var(--muted); font-size: 13px; }
+
+  .hint { padding: 10px 14px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); }
+  .hint code { color: var(--accent); font-family: var(--mono); }
+
+  #drop {
+    position: fixed; inset: 0;
+    background: rgba(13, 17, 23, 0.92);
+    border: 3px dashed var(--accent);
+    display: none;
+    align-items: center; justify-content: center;
+    font-size: 20px; color: var(--accent);
+    z-index: 100;
+  }
+  #drop.show { display: flex; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SSD1306 Simulator <span>128&times;64 &middot; 0.96"</span></h1>
+  <div class="grp">
+    <select id="examples" aria-label="Example sketch"></select>
+    <button id="load">Open .ino&hellip;</button>
+    <input type="file" id="file" accept=".ino,.cpp,.c,.h,.txt" class="sr">
+  </div>
+  <div class="spacer"></div>
+  <button id="run" class="primary">Run</button>
+  <button id="step">Step frame</button>
+  <button id="reset">Reset</button>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <h2>Sketch
+        <span class="right" id="sketch-name">01-hello-oled.ino</span>
+      </h2>
+      <div class="editor-wrap">
+        <div class="gutter" id="gutter">1</div>
+        <textarea id="code" spellcheck="false" wrap="off"></textarea>
+      </div>
+      <pre id="error"></pre>
+    </div>
+
+    <div class="card">
+      <h2>Serial monitor <span class="right"><button id="clear-serial">Clear</button></span></h2>
+      <div id="serial"><span class="empty">nothing printed yet</span></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <h2>Display <span class="right" id="frame-label">no frame yet</span></h2>
+      <div class="stage"><canvas id="screen"></canvas></div>
+
+      <div class="controls">
+        <div class="grp">
+          <label class="check" for="speed">Speed</label>
+          <select id="speed">
+            <option value="0.25">0.25&times;</option>
+            <option value="1" selected>1&times;</option>
+            <option value="2">2&times;</option>
+            <option value="5">5&times;</option>
+            <option value="20">20&times;</option>
+          </select>
+        </div>
+        <div class="grp">
+          <label class="check" for="zoom">Zoom</label>
+          <select id="zoom">
+            <option value="actual">1:1 (real size)</option>
+            <option value="2">2&times;</option>
+            <option value="3">3&times;</option>
+            <option value="4">4&times;</option>
+            <option value="5" selected>5&times;</option>
+            <option value="7">7&times;</option>
+          </select>
+        </div>
+        <div class="grp">
+          <label class="check" for="theme">Panel</label>
+          <select id="theme">
+            <option value="white" selected>White</option>
+            <option value="blue">Blue</option>
+            <option value="yellow">Yellow</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="controls">
+        <label class="check"><input type="checkbox" id="grid" checked> Pixel grid</label>
+        <label class="check"><input type="checkbox" id="glow" checked> Glow</label>
+        <label class="check"><input type="checkbox" id="burn"> Burn-in map</label>
+        <div class="spacer"></div>
+        <button id="png">Save PNG</button>
+        <button id="cbitmap">Copy as C array</button>
+      </div>
+
+      <div class="stats" id="stats"></div>
+    </div>
+
+    <div class="card">
+      <h2>Virtual I/O <span class="right" id="io-note"></span></h2>
+      <div id="io"><div class="io-empty">Pins appear here once the sketch reads one.</div></div>
+      <p class="hint">
+        Whatever the sketch passes to <code>analogRead()</code> or
+        <code>digitalRead()</code> shows up as a control. Unread pins are not listed.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Bus</h2>
+      <div class="stats" id="bus"></div>
+      <p class="hint">
+        A full frame is 1024 bytes over I&sup2;C. That transfer time is charged to the
+        clock, so the frame rate here is the one the panel can actually reach.
+      </p>
+    </div>
+  </section>
+</main>
+
+<div id="drop">Drop a .ino file to load it</div>
+
+<script src="src/glcdfont.js"></script>
+<script src="src/display.js"></script>
+<script src="src/lexer.js"></script>
+<script src="src/parser.js"></script>
+<script src="src/interpreter.js"></script>
+<script src="src/runtime.js"></script>
+<script src="src/renderer.js"></script>
+<script src="src/examples.js"></script>
+<script src="src/app.js"></script>
+</body>
+</html>

@@ -7,6 +7,22 @@ Project to test and deploy an initial simple project on this small OLED display:
 
 Full reference: [`docs/hosyond-0.96in-oled-ssd1306-128x64.md`](docs/hosyond-0.96in-oled-ssd1306-128x64.md)
 
+## Try a sketch without the hardware
+
+[`simulator/`](simulator/README.md) runs an `.ino` file and shows you what this
+panel would display. Open `simulator/index.html` in a browser — no server, no
+build step, no dependencies — or render headlessly:
+
+```bash
+node simulator/cli/render.js simulator/examples/02-co2-monitor.ino --ascii
+node simulator/cli/render.js my-sketch.ino --at 5000 --out frame.png
+```
+
+It is a port of the real Adafruit_GFX drawing algorithms against the actual
+`glcdfont` table, so the output is pixel-identical to the panel. It also
+charges the clock for the I²C frame transfer, which is how it can tell you the
+frame rate you will really get (≈43 fps at 400 kHz, ≈11 fps at 100 kHz).
+
 ## The display at a glance
 
 | | |
@@ -85,8 +101,13 @@ void setup() {
 void loop() {}
 ```
 
+The same sketch is in the simulator as
+[`simulator/examples/01-hello-oled.ino`](simulator/examples/01-hello-oled.ino),
+so you can see the result before the parts arrive.
+
 Libraries: **Adafruit_SSD1306 + Adafruit_GFX** (simple, 1 KB frame buffer) or **U8g2**
-(more fonts, page-buffered for low-RAM hosts).
+(more fonts, page-buffered for low-RAM hosts). The simulator emulates the
+Adafruit stack.
 
 Nothing on screen? Run an I²C scanner first — a healthy board answers at 0x3C or 0x3D.
 See the [troubleshooting table](docs/hosyond-0.96in-oled-ssd1306-128x64.md#6-troubleshooting)
