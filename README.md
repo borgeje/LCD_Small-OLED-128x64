@@ -41,6 +41,9 @@ external resistors.
 | SDA | **GPIO21** | Arduino-ESP32 default SDA — plain `Wire.begin()` just works |
 | SCL | **GPIO22** | Arduino-ESP32 default SCL |
 
+Full wiring walkthrough for this board, with an ASCII pin map and flashing notes:
+[`docs/wiring-esp32-devkit.md`](docs/wiring-esp32-devkit.md).
+
 Alternates if those are taken: GPIO25/26/27, GPIO32/33, GPIO18/19/23.
 **Avoid:** GPIO6–11 (SPI flash), GPIO34–39 (input-only, no pull-ups — SDA cannot work
 there), GPIO0/2/5/12/15 (strapping pins; a pull-up on GPIO12 can stop the board
@@ -60,6 +63,22 @@ sit next to 3V3/GND on the same edge — a clean 4-wire run with no crossing.
 **Avoid:** GPIO15 (user LED), GPIO3 and GPIO14 (RF switch enable and antenna select —
 driving them breaks Wi-Fi/BLE), and the `5V` pad (unregulated USB, absent on battery).
 Any other pad works via `Wire.begin(sda, scl)`.
+
+## Demo: animated sine wave
+
+[`examples/sine_wave/sine_wave.ino`](examples/sine_wave/sine_wave.ino) — a travelling
+sine wave with a dotted echo wave running against it, a breathing amplitude envelope, a
+dot riding the crest, and a live frame-rate readout. Wire it as above and flash.
+
+**Arduino IDE** — install **Adafruit SSD1306** and **Adafruit GFX Library** from the
+Library Manager, open the sketch, select *ESP32 Dev Module*, upload.
+
+**PlatformIO** — `pio run -t upload` from the repository root; [`platformio.ini`](platformio.ini)
+pins the board and both libraries.
+
+It auto-detects the display at 0x3C or 0x3D and prints the address it found at
+115200 baud. Expect roughly 30–40 fps: a full 128×64 frame is 1 KB, and at 400 kHz pushing it over
+the bus is what sets the frame rate, not the drawing.
 
 ## Quick start (Arduino, both boards)
 
