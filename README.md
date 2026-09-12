@@ -23,6 +23,19 @@ It is a port of the real Adafruit_GFX drawing algorithms against the actual
 charges the clock for the I²C frame transfer, which is how it can tell you the
 frame rate you will really get (≈43 fps at 400 kHz, ≈11 fps at 100 kHz).
 
+## Build something on it
+
+[`firmware/glance/`](firmware/README.md) is a widget framework for this panel:
+each screen is a class with a `render()`, and the host handles rotation,
+alarms that interrupt, button pinning, frame pacing, and burn-in. Five screens
+ship with it — CO₂, next meeting, build status, parking sensor, freezer
+watchdog — each with a synthetic data source so the whole thing runs in the
+simulator before you buy a sensor.
+
+```bash
+node simulator/cli/render.js firmware/glance/glance.ino --at 30000 --ascii --stats
+```
+
 ## The display at a glance
 
 | | |

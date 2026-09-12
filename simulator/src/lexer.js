@@ -33,6 +33,8 @@
     "size_t", "String", "auto", "PROGMEM", "inline", "extern", "register",
     "uint8_t", "uint16_t", "uint32_t", "uint64_t",
     "int8_t", "int16_t", "int32_t", "int64_t",
+    "virtual", "explicit", "override", "final", "this", "namespace", "using",
+    "operator", "friend", "template", "typename",
   ]);
 
   // Longest-first so that ">>=" beats ">>" beats ">".
@@ -81,7 +83,24 @@
   /* ------------------------------------------------------------------ *
    * Preprocessor
    * ------------------------------------------------------------------ */
-  function preprocess(src) {
+  /*
+   * preprocess(src, options)
+   *
+   * options.resolveInclude(name) may return { source, path } for a local
+   * `#include "x.h"`, which is then inlined here. Because that shifts every
+   * line after it, a parallel line map is built so errors can still be
+   * reported against the file and line the author actually wrote.
+   *
+   * Local includes are include-once, matching `#pragma once`; every header in
+   * practice carries a guard anyway, and the classic #ifndef form keeps
+   * working on its own because defines persist across the inlined text.
+   */
+  function preprocess(src, options) {
+    options = options || {};
+    const resolveInclude = options.resolveInclude || null;
+    const rootName = options.fileName || "sketch.ino";
+    const includedOnce = options.__included || new Set();
+
     const clean = stripComments(src);
     // A backslash continuation folds the next line up into this one; emit a
     // marker newline afterwards so the running line count stays correct.
@@ -98,14 +117,21 @@
       for (let k = 0; k < extra; k++) folded.push("");
     }
 
-    const defines = new Map();
+    const defines = options.__defines || new Map();
     const includes = [];
     const out = [];
+    const map = []; // out[i] came from map[i] = { file, line }
     const stack = [];
 
     const active = () => stack.every((f) => f.active);
 
-    for (const raw of folded) {
+    const emit = (text, file, line) => {
+      out.push(text);
+      map.push({ file, line });
+    };
+
+    for (let li = 0; li < folded.length; li++) {
+      const raw = folded[li];
       const t = raw.trim();
 
       if (t.startsWith("#")) {
@@ -116,8 +142,29 @@
         switch (directive) {
           case "include":
             if (active()) {
-              const inc = rest.match(/[<"]([^>"]+)[>"]/);
-              if (inc) includes.push(inc[1]);
+              const inc = rest.match(/([<"])([^>"]+)[>"]/);
+              if (inc) {
+                includes.push(inc[2]);
+                // Only local ("quoted") includes are inlined; library headers
+                // stay recorded-but-absent, as before.
+                if (inc[1] === '"' && resolveInclude) {
+                  const resolved = resolveInclude(inc[2]);
+                  if (resolved && !includedOnce.has(resolved.path)) {
+                    includedOnce.add(resolved.path);
+                    const nested = preprocess(resolved.source, {
+                      resolveInclude,
+                      fileName: resolved.path,
+                      __included: includedOnce,
+                      __defines: defines,
+                    });
+                    for (let k = 0; k < nested.lines.length; k++) {
+                      emit(nested.lines[k], nested.map[k].file, nested.map[k].line);
+                    }
+                    for (const nestedInc of nested.includes) includes.push(nestedInc);
+                    continue;
+                  }
+                }
+              }
             }
             break;
           case "define":
@@ -176,13 +223,19 @@
           default:
             break; // #pragma, #error, #line - ignored
         }
-        out.push("");
+        emit("", rootName, li + 1);
       } else {
-        out.push(active() ? raw : "");
+        emit(active() ? raw : "", rootName, li + 1);
       }
     }
 
-    return { source: out.join("\n"), defines, includes };
+    return {
+      source: out.join("\n"),
+      lines: out,
+      map,
+      defines,
+      includes,
+    };
   }
 
   // Enough of #if to handle the guards real sketches carry.
@@ -439,11 +492,17 @@
     return changed ? expandMacros(out, defines, depth + 1) : out;
   }
 
-  function lex(src) {
-    const pre = preprocess(src);
+  function lex(src, options) {
+    const pre = preprocess(src, options);
     const tokens = tokenize(pre.source);
     const expanded = expandMacros(tokens, pre.defines, 0);
-    return { tokens: expanded, includes: pre.includes, defines: pre.defines };
+    return {
+      tokens: expanded,
+      includes: pre.includes,
+      defines: pre.defines,
+      lineMap: pre.map,
+      flattened: pre.source,
+    };
   }
 
   return { lex, tokenize, preprocess, CompileError, KEYWORDS };

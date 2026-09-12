@@ -114,6 +114,20 @@ correct precedence, casts, `sizeof`, and the preprocessor — `#define` (object
 and function-like), `#ifdef` / `#ifndef` / `#if` / `#elif` / `#else` / `#endif`,
 `#include`, `#undef`.
 
+**Classes**, which is what makes a widget framework expressible: single
+inheritance, virtual and pure-virtual methods with dynamic dispatch,
+constructors with member-initialiser lists (including `: Base(args)`),
+methods defined inline or out of line as `void Foo::bar()`, `this`, access
+specifiers, class-typed and pointer members, `new` and `delete`, and arrays of
+base-class pointers. Every call is dispatched on the object's real type, so
+`virtual` is accepted and never needed for correctness here.
+
+**Multiple files.** A local `#include "x.h"` is resolved relative to the sketch
+(the CLI reads it from disk; in the browser, use the flattener below). Headers
+are include-once. Line numbers are mapped back through the inlining, so an
+error inside a header reports that header's own file and line rather than an
+offset into a file that only exists inside the preprocessor.
+
 **Device behaviour that trips people up, reproduced rather than corrected:**
 
 | | |
@@ -143,8 +157,13 @@ Know these before you trust a result:
   synthesise their readings and say so in a comment.
 - **Networking, filesystem, FreeRTOS tasks, interrupts.** `attachInterrupt()`
   is accepted and never fires; WiFi/HTTPClient are not provided.
-- **Classes defined in the sketch.** `struct` with data members works;
-  user-defined classes with methods do not. Free functions are the way.
+- **Copying an object by value.** Instances are handled as references
+  throughout, so `Widget a = b;` aliases rather than copies. `Widget *w = &b;`
+  — the shape real firmware uses — behaves correctly. `struct` still copies on
+  assignment, as C does.
+- **Templates, operator overloading, multiple inheritance, destructors.**
+  `~Foo()` is parsed and its body dropped; nothing here is reclaimed, since a
+  sketch runs for one session.
 - **Hardware scroll** is simplified to a whole-panel horizontal shift rather
   than the SSD1306's true per-page scroll.
 - **Timing is a model, not a simulation.** Interpreted steps are charged about
@@ -187,16 +206,28 @@ latches a frame. The sketch has no idea it is being paused, stepped, or run at
 | `src/examples.js` | generated; see below |
 | `cli/render.js` | headless renderer |
 | `cli/png.js` | dependency-free PNG writer |
-| `test/run-tests.js` | 64 tests |
+| `tools/flatten.js` | inline local headers into one .ino, for the browser |
+| `test/run-tests.js` | 89 tests |
 
-`src/examples.js` is generated so the page works from `file://`, where fetching
-a sibling file is blocked. After editing anything in `examples/`, run:
+Two files are generated, both because the browser has no filesystem:
+`src/examples.js` inlines the example sketches, and
+`examples/06-glance-framework.ino` is `firmware/glance/` with its headers
+folded into one file. After editing either source, run:
 
 ```bash
+node simulator/tools/flatten.js firmware/glance/glance.ino \
+     simulator/examples/06-glance-framework.ino
 node simulator/tools/bundle-examples.js
 ```
 
 The test suite fails if you forget.
+
+The CLI needs neither: it resolves `#include "x.h"` from disk, so point it
+straight at a multi-file project.
+
+```bash
+node simulator/cli/render.js firmware/glance/glance.ino --at 30000 --ascii
+```
 
 ---
 
@@ -209,10 +240,15 @@ The test suite fails if you forget.
 | `03-parking-sensor.ino` | garage stop sign, three states, size-4 digits |
 | `04-build-status.ino` | CI tick/cross drawn as geometry, inverts on red |
 | `05-readability-ruler.ino` | text sizes, a pixel grid, and every primitive |
+| `06-glance-framework.ino` | the [widget framework](../firmware/README.md), flattened (generated) |
 
 Start with `05-readability-ruler.ino` at **1:1 zoom**. It is the fastest way to
 calibrate what will actually fit on a screen this size — which, more than
 anything else, decides what is worth building on it.
+
+Then watch `06-glance-framework.ino` for a minute: the rotation, the parking
+sensor interrupting it, the build widget inverting the panel, and the one-pixel
+burn-in shift that arrives at the sixty-second mark.
 
 ---
 

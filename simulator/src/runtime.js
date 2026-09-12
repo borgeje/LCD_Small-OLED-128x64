@@ -343,6 +343,7 @@
     declare("digitalRead", hostfn((a) => {
       const pin = Math.trunc(asNumber(a[0]));
       interp.io.pinsRead.add(pin);
+      interp.io.digitalPins.add(pin);
       const mode = interp.io.pinModes[pin];
       // An INPUT_PULLUP pin with nothing attached reads HIGH, as on hardware.
       const dflt = mode === 2 ? 1 : 0;
@@ -351,6 +352,7 @@
     declare("analogRead", hostfn((a) => {
       const pin = Math.trunc(asNumber(a[0]));
       interp.io.pinsRead.add(pin);
+      interp.io.analogPins.add(pin);
       return num(interp.io.analog[pin] === undefined ? 0 : interp.io.analog[pin], false);
     }));
     declare("analogWrite", hostfn((a) => {
@@ -606,7 +608,11 @@
       this.loopOverheadUs =
         options.loopOverheadUs === undefined ? 2 : options.loopOverheadUs;
 
-      this.program = parse(source);
+      this.program = parse(source, {
+        resolveInclude: options.resolveInclude || null,
+        fileName: options.fileName || "sketch.ino",
+      });
+      this.lineMap = this.program.lineMap || null;
       this.interp = new Interpreter(options);
       installGlobals(this.interp);
       this.interp.load(this.program);
@@ -633,6 +639,27 @@
     }
     get serial() {
       return this.interp.serial;
+    }
+
+    /*
+     * Map a line in the flattened source back to the file and line the author
+     * wrote. Without this, an error inside an included header points at a line
+     * number in a file that only exists inside the preprocessor.
+     */
+    locate(line) {
+      if (!this.lineMap || !line || line < 1 || line > this.lineMap.length) {
+        return { file: this.options.fileName || "sketch.ino", line: line || 0 };
+      }
+      return this.lineMap[line - 1];
+    }
+
+    /** The same error, with `file` and `line` pointing at real source. */
+    locateError(e) {
+      if (!e) return e;
+      const where = this.locate(e.line);
+      e.file = where.file;
+      e.sourceLine = where.line;
+      return e;
     }
 
     // The sketch as one long generator: globals, setup(), then loop() forever.
@@ -694,10 +721,10 @@
         try {
           r = this.gen.next();
         } catch (e) {
-          this.error = e;
+          this.error = this.locateError(e);
           this.finished = true;
           interp.flushSerial();
-          return { reason: "error", error: e };
+          return { reason: "error", error: this.error };
         }
 
         if (r.done) {

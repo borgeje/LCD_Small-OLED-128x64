@@ -11,6 +11,7 @@
  */
 "use strict";
 
+const fs = require("fs");
 const path = require("path");
 const { SSD1306 } = require("../src/display.js");
 const { FONT } = require("../src/glcdfont.js");
@@ -481,6 +482,241 @@ check("PROGMEM arrays read back through pgm_read_byte", () => {
 });
 
 /* ------------------------------------------------------------------ */
+group("classes");
+
+// A class, a subclass overriding one method, and a shared base field.
+const CLASS_SRC =
+  "#include <Adafruit_SSD1306.h>\n" +
+  "Adafruit_SSD1306 display(128, 64, &Wire, -1);\n" +
+  "class Shape {\n" +
+  "public:\n" +
+  "  Shape(int x) : ox(x), drawn(0) {}\n" +
+  "  virtual void draw() = 0;\n" +
+  "  virtual const char *name() { return \"shape\"; }\n" +
+  "  void tally() { drawn++; }\n" +
+  "  int ox;\n" +
+  "  int drawn;\n" +
+  "};\n" +
+  "class Box : public Shape {\n" +
+  "public:\n" +
+  "  Box(int x, int w) : Shape(x), width(w) {}\n" +
+  "  void draw() override { tally(); display.fillRect(ox, 0, width, 4, SSD1306_WHITE); }\n" +
+  "  const char *name() override { return \"box\"; }\n" +
+  "  int width;\n" +
+  "};\n" +
+  "class Dot : public Shape {\n" +
+  "public:\n" +
+  "  Dot(int x) : Shape(x) {}\n" +
+  "  void draw() override { this->tally(); display.drawPixel(this->ox, 20, SSD1306_WHITE); }\n" +
+  "};\n";
+
+check("a subclass overrides a virtual method", () => {
+  const src = CLASS_SRC +
+    "void setup() {\n" +
+    "  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);\n" +
+    "  Shape *s = new Box(0, 10);\n" +
+    "  s->draw();\n" +
+    "  display.display();\n" +
+    "}\nvoid loop() {}\n";
+  const s = run(src, 0);
+  eq(litCount(s.display), 40, "the Box override drew, not the base");
+});
+
+check("calls through a base pointer are dynamically bound", () => {
+  const src = CLASS_SRC +
+    "void setup() {\n" +
+    "  Serial.begin(115200);\n" +
+    "  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);\n" +
+    "  Shape *shapes[2];\n" +
+    "  shapes[0] = new Box(0, 10);\n" +
+    "  shapes[1] = new Dot(50);\n" +
+    "  for (int i = 0; i < 2; i++) { shapes[i]->draw(); Serial.println(shapes[i]->name()); }\n" +
+    "  display.display();\n" +
+    "}\nvoid loop() {}\n";
+  const s = run(src, 0);
+  eq(litCount(s.display), 41, "10x4 box plus one dot");
+  eq(s.serial.map((l) => l.text), ["box", "shape"], "Dot inherits name()");
+});
+
+check("a base constructor runs through the member init list", () => {
+  const src = CLASS_SRC +
+    "void setup() {\n" +
+    "  Serial.begin(115200);\n" +
+    "  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);\n" +
+    "  Box b(7, 3);\n" +
+    "  Serial.println(b.ox);\n" +
+    "  Serial.println(b.width);\n" +
+    "}\nvoid loop() {}\n";
+  const s = new Sketch(src);
+  s.runUntil(10, { wallMs: 5000 });
+  if (s.error) throw s.error;
+  eq(s.serial.map((l) => l.text), ["7", "3"]);
+});
+
+check("a method reaches a sibling method and an inherited field", () => {
+  const src = CLASS_SRC +
+    "void setup() {\n" +
+    "  Serial.begin(115200);\n" +
+    "  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);\n" +
+    "  Box b(0, 2);\n" +
+    "  b.draw(); b.draw(); b.draw();\n" +
+    "  Serial.println(b.drawn);\n" +
+    "}\nvoid loop() {}\n";
+  const s = new Sketch(src);
+  s.runUntil(10, { wallMs: 5000 });
+  if (s.error) throw s.error;
+  eq(s.serial[0].text, "3", "tally() ran on the base field each time");
+});
+
+check("a constructor parameter shadows the field it initialises", () => {
+  const src =
+    "class Holder {\n" +
+    "public:\n" +
+    "  Holder(int value) : value(value) {}\n" +
+    "  int value;\n" +
+    "};\n" +
+    "void setup() { Serial.begin(115200); Holder h(42); Serial.println(h.value); }\n" +
+    "void loop() {}\n";
+  const s = new Sketch(src);
+  s.runUntil(10, { wallMs: 5000 });
+  if (s.error) throw s.error;
+  eq(s.serial[0].text, "42");
+});
+
+check("out-of-line method definitions attach to their class", () => {
+  const src =
+    "class Counter {\n" +
+    "public:\n" +
+    "  Counter();\n" +
+    "  void bump();\n" +
+    "  int n;\n" +
+    "};\n" +
+    "Counter::Counter() : n(10) {}\n" +
+    "void Counter::bump() { n = n + 5; }\n" +
+    "void setup() { Serial.begin(115200); Counter c; c.bump(); Serial.println(c.n); }\n" +
+    "void loop() {}\n";
+  const s = new Sketch(src);
+  s.runUntil(10, { wallMs: 5000 });
+  if (s.error) throw s.error;
+  eq(s.serial[0].text, "15");
+});
+
+check("an object reached through a pointer is shared, not copied", () => {
+  const src = CLASS_SRC +
+    "void setup() {\n" +
+    "  Serial.begin(115200);\n" +
+    "  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);\n" +
+    "  Box *a = new Box(0, 1);\n" +
+    "  Box *b = a;\n" +
+    "  b->draw();\n" +
+    "  Serial.println(a->drawn);\n" +
+    "}\nvoid loop() {}\n";
+  const s = new Sketch(src);
+  s.runUntil(10, { wallMs: 5000 });
+  if (s.error) throw s.error;
+  eq(s.serial[0].text, "1", "both names refer to one object");
+});
+
+check("a class-typed member is constructed with its owner", () => {
+  const src =
+    "class Inner { public: Inner() : v(9) {} int v; };\n" +
+    "class Outer { public: Outer() {} Inner inner; };\n" +
+    "void setup() { Serial.begin(115200); Outer o; Serial.println(o.inner.v); }\n" +
+    "void loop() {}\n";
+  const s = new Sketch(src);
+  s.runUntil(10, { wallMs: 5000 });
+  if (s.error) throw s.error;
+  eq(s.serial[0].text, "9");
+});
+
+check("calling a pure virtual says so", () => {
+  const src = CLASS_SRC +
+    "class Blank : public Shape { public: Blank() : Shape(0) {} };\n" +
+    "void setup() { display.begin(SSD1306_SWITCHCAPVCC, 0x3C); Shape *s = new Blank(); s->draw(); }\n" +
+    "void loop() {}\n";
+  const s = new Sketch(src);
+  s.runUntil(10, { wallMs: 5000 });
+  ok(s.error, "expected an error");
+  ok(/pure virtual/.test(s.error.message), s.error.message);
+});
+
+check("an uninitialised object pointer is null and tests false", () => {
+  const src =
+    "class Thing { public: Thing() {} int v; };\n" +
+    "Thing *slot[3];\n" +
+    "void setup() {\n" +
+    "  Serial.begin(115200);\n" +
+    "  slot[1] = new Thing();\n" +
+    "  int found = 0;\n" +
+    "  for (int i = 0; i < 3; i++) if (slot[i]) found++;\n" +
+    "  Serial.println(found);\n" +
+    "}\nvoid loop() {}\n";
+  const s = new Sketch(src);
+  s.runUntil(10, { wallMs: 5000 });
+  if (s.error) throw s.error;
+  eq(s.serial[0].text, "1");
+});
+
+/* ------------------------------------------------------------------ */
+group("multi-file sketches");
+
+// Headers are supplied in memory, the same hook the CLI fills from disk.
+const HEADERS = {
+  "math.h": "#pragma once\nint twice(int v) { return v * 2; }\n",
+  "bad.h": "#pragma once\nint oops(int v) { return v + missingName; }\n",
+  "chain.h": '#pragma once\n#include "math.h"\nint quad(int v) { return twice(twice(v)); }\n',
+};
+const resolveInclude = (name) =>
+  HEADERS[name] ? { source: HEADERS[name], path: name } : null;
+
+check("a local #include is inlined and its functions callable", () => {
+  const src =
+    '#include <Adafruit_SSD1306.h>\n#include "math.h"\n' +
+    "Adafruit_SSD1306 display(128, 64, &Wire, -1);\n" +
+    "void setup() { Serial.begin(115200); Serial.println(twice(21)); }\n" +
+    "void loop() {}\n";
+  const s = new Sketch(src, { resolveInclude, fileName: "test.ino" });
+  s.runUntil(10, { wallMs: 5000 });
+  if (s.error) throw s.error;
+  eq(s.serial[0].text, "42");
+});
+
+check("nested includes resolve, and repeats are included once", () => {
+  const src =
+    '#include "math.h"\n#include "chain.h"\n#include "math.h"\n' +
+    "void setup() { Serial.begin(115200); Serial.println(quad(3)); }\n" +
+    "void loop() {}\n";
+  const s = new Sketch(src, { resolveInclude, fileName: "test.ino" });
+  s.runUntil(10, { wallMs: 5000 });
+  if (s.error) throw s.error;
+  eq(s.serial[0].text, "12");
+});
+
+check("an error inside a header reports that header's own line", () => {
+  const src =
+    '#include "bad.h"\n' +
+    "void setup() { Serial.begin(115200); Serial.println(oops(1)); }\n" +
+    "void loop() {}\n";
+  const s = new Sketch(src, { resolveInclude, fileName: "test.ino" });
+  s.runUntil(10, { wallMs: 5000 });
+  ok(s.error, "expected an error");
+  eq(s.error.file, "bad.h", "blamed the right file");
+  eq(s.error.sourceLine, 2, "line within bad.h");
+});
+
+check("a line in the main sketch still maps to the sketch", () => {
+  const src =
+    '#include "math.h"\n' +
+    "void setup() { int a = alsoMissing; }\n" +
+    "void loop() {}\n";
+  const s = new Sketch(src, { resolveInclude, fileName: "test.ino" });
+  s.runUntil(10, { wallMs: 5000 });
+  ok(s.error, "expected an error");
+  eq(s.error.file, "test.ino");
+  eq(s.error.sourceLine, 2);
+});
+
+/* ------------------------------------------------------------------ */
 group("preprocessor");
 
 check("#define substitutes into expressions", () => {
@@ -735,9 +971,196 @@ check("C bitmap round-trips through drawBitmap", () => {
 });
 
 /* ------------------------------------------------------------------ */
+group("glance framework");
+
+// Resolve the framework's real headers off disk, the same way the CLI does.
+const firmwareDir = path.join(__dirname, "..", "..", "firmware", "glance");
+const resolveFirmware = (name) => {
+  const file = path.join(firmwareDir, name);
+  return fs.existsSync(file)
+    ? { source: fs.readFileSync(file, "utf8"), path: name }
+    : null;
+};
+
+function firmwareSketch(body, globals) {
+  return (
+    "#include <Wire.h>\n#include <Adafruit_GFX.h>\n#include <Adafruit_SSD1306.h>\n" +
+    '#include "WidgetHost.h"\n' +
+    "Adafruit_SSD1306 display(128, 64, &Wire, -1);\n" +
+    (globals || "") +
+    "void setup() {\n" +
+    "  Serial.begin(115200);\n" +
+    "  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);\n" +
+    body +
+    "}\n"
+  );
+}
+
+function runFirmware(src, ms) {
+  const s = new Sketch(src, { resolveInclude: resolveFirmware, fileName: "test.ino" });
+  s.runUntil(ms, { wallMs: 30000 });
+  if (s.error) throw s.error;
+  return s;
+}
+
+check("Series keeps the most recent SERIES_MAX samples", () => {
+  const src = firmwareSketch(
+    "  Series s;\n" +
+    "  for (int i = 0; i < 70; i++) s.push(i);\n" +
+    "  Serial.println(s.size());\n" +
+    "  Serial.println(s.at(0));\n" +
+    "  Serial.println(s.latest());\n" +
+    "  Serial.println(s.minValue());\n" +
+    "  Serial.println(s.maxValue());\n" +
+    "  Serial.println(s.deltaOver(10));\n"
+  ) + "void loop() {}\n";
+  const s = runFirmware(src, 10);
+  // 70 pushed, 64 retained: 6..69.
+  eq(s.serial.map((l) => l.text), ["64", "6", "69", "6", "69", "10"]);
+});
+
+check("Ui.fitSize picks the largest text size that fits", () => {
+  const src = firmwareSketch(
+    "  Ui ui; ui.d = &display;\n" +
+    "  Serial.println(ui.fitSize(\"1234\", 104));\n" +   // 4*6*4 = 96
+    "  Serial.println(ui.fitSize(\"123456\", 104));\n" + // needs size 2
+    "  Serial.println(ui.fitSize(\"88:88\", 128));\n"
+  ) + "void loop() {}\n";
+  const s = runFirmware(src, 10);
+  eq(s.serial.map((l) => l.text), ["4", "2", "4"]);
+});
+
+check("the host rotates between widgets on their dwell time", () => {
+  const globals =
+    "class ProbeA : public Widget {\n" +
+    "public:\n" +
+    "  const char *name() override { return \"A\"; }\n" +
+    "  unsigned long dwellMs() override { return 200; }\n" +
+    "  void render(Ui &ui) override { Serial.println(\"A\"); ui.pixel(0, 0); }\n" +
+    "};\n" +
+    "class ProbeB : public Widget {\n" +
+    "public:\n" +
+    "  const char *name() override { return \"B\"; }\n" +
+    "  unsigned long dwellMs() override { return 200; }\n" +
+    "  void render(Ui &ui) override { Serial.println(\"B\"); ui.pixel(10, 0); }\n" +
+    "};\n" +
+    "WidgetHost host(display);\n" +
+    "ProbeA a;\nProbeB b;\n";
+  const src = firmwareSketch(
+    "  host.add(&a);\n  host.add(&b);\n" +
+    "  host.setFrameInterval(50);\n  host.begin();\n",
+    globals
+  ) + "void loop() { host.tick(millis()); delay(5); }\n";
+
+  const s = runFirmware(src, 900);
+  const seen = s.serial.map((l) => l.text);
+  ok(seen.indexOf("A") >= 0, "A never rendered");
+  ok(seen.indexOf("B") >= 0, "B never rendered");
+});
+
+check("an urgent widget takes the screen and keeps it", () => {
+  const globals =
+    "class Calm : public Widget {\n" +
+    "public:\n" +
+    "  unsigned long dwellMs() override { return 200; }\n" +
+    "  void render(Ui &ui) override { Serial.println(\"calm\"); }\n" +
+    "};\n" +
+    "class Alarm : public Widget {\n" +
+    "public:\n" +
+    "  unsigned long dwellMs() override { return 200; }\n" +
+    "  bool urgent() override { return millis() > 600; }\n" +
+    "  void render(Ui &ui) override { Serial.println(\"alarm\"); }\n" +
+    "};\n" +
+    "WidgetHost host(display);\n" +
+    "Calm calm;\nAlarm alarm;\n";
+  const src = firmwareSketch(
+    "  host.add(&calm);\n  host.add(&alarm);\n" +
+    "  host.setFrameInterval(50);\n  host.begin();\n",
+    globals
+  ) + "void loop() { host.tick(millis()); delay(5); }\n";
+
+  const s = runFirmware(src, 1400);
+  const early = s.serial.filter((l) => l.t < 500).map((l) => l.text);
+  const late = s.serial.filter((l) => l.t > 800).map((l) => l.text);
+  ok(early.indexOf("calm") >= 0, "calm should show before the alarm trips");
+  ok(late.length > 3, "expected frames after the alarm tripped");
+  eq(
+    late.filter((x) => x !== "alarm").length,
+    0,
+    "once urgent, nothing else gets the screen"
+  );
+});
+
+check("a short button press advances, a long press pins", () => {
+  const globals =
+    "class One : public Widget {\n" +
+    "public:\n" +
+    "  unsigned long dwellMs() override { return 100000; }\n" +   // never rotates on its own
+    "  void render(Ui &ui) override { Serial.println(\"one\"); }\n" +
+    "};\n" +
+    "class Two : public Widget {\n" +
+    "public:\n" +
+    "  unsigned long dwellMs() override { return 100000; }\n" +
+    "  void render(Ui &ui) override { Serial.println(\"two\"); }\n" +
+    "};\n" +
+    "WidgetHost host(display);\n" +
+    "One one;\nTwo two;\n";
+  const src = firmwareSketch(
+    "  host.add(&one);\n  host.add(&two);\n" +
+    "  host.setButton(4);\n" +
+    "  host.setFrameInterval(50);\n  host.begin();\n",
+    globals
+  ) + "void loop() { host.tick(millis()); delay(5); }\n";
+
+  const s = new Sketch(src, { resolveInclude: resolveFirmware, fileName: "test.ino" });
+
+  // The dwell is effectively infinite, so only the button can change screens.
+  s.runUntil(300, { wallMs: 20000 });
+  if (s.error) throw s.error;
+  const before = s.serial.map((l) => l.text);
+  eq(before[before.length - 1], "one", "starts on the first widget");
+
+  s.setDigital(4, 0);                        // press
+  s.runUntil(400, { wallMs: 20000 });
+  s.setDigital(4, 1);                        // release, well under the long-press
+  s.runUntil(700, { wallMs: 20000 });
+  if (s.error) throw s.error;
+  const after = s.serial.map((l) => l.text);
+  eq(after[after.length - 1], "two", "a short press advanced the screen");
+});
+
+check("glance.ino runs, rotates, and reaches its alarm states", () => {
+  const entry = path.join(firmwareDir, "glance.ino");
+  const src = fs.readFileSync(entry, "utf8");
+  const s = new Sketch(src, { resolveInclude: resolveFirmware, fileName: "glance.ino" });
+  s.runUntil(30000, { wallMs: 60000 });
+  if (s.error) throw s.error;
+  ok(s.frames > 100, "expected a few hundred frames, got " + s.frames);
+  ok(litCount(s.display) > 0, "something is on screen");
+  // 10 fps requested via setFrameInterval(100).
+  near(s.fps(), 10, 2.5, "frame pacing");
+});
+
+check("the flattened example matches the firmware it came from", () => {
+  const { flatten } = require("../tools/flatten.js");
+  const entry = path.join(firmwareDir, "glance.ino");
+  const generated = flatten(entry);
+  const onDisk = fs.readFileSync(
+    path.join(__dirname, "..", "examples", "06-glance-framework.ino"), "utf8"
+  );
+  // The file on disk carries a generated-by banner ahead of the same body.
+  if (onDisk.indexOf(generated) < 0) {
+    throw new Error(
+      "06-glance-framework.ino is stale. Run:\n" +
+      "  node simulator/tools/flatten.js firmware/glance/glance.ino " +
+      "simulator/examples/06-glance-framework.ino"
+    );
+  }
+});
+
+/* ------------------------------------------------------------------ */
 group("bundled examples");
 
-const fs = require("fs");
 const exDir = path.join(__dirname, "..", "examples");
 for (const file of fs.readdirSync(exDir).filter((f) => f.endsWith(".ino")).sort()) {
   check(file + " runs and draws", () => {

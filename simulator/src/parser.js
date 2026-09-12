@@ -35,7 +35,7 @@
 
   const QUALIFIERS = new Set([
     "const", "static", "volatile", "unsigned", "signed", "extern",
-    "register", "inline", "PROGMEM",
+    "register", "inline", "PROGMEM", "virtual", "explicit",
   ]);
 
   // Assignment operators, all right-associative at the same precedence.
@@ -174,13 +174,37 @@
     parseStructOrClass(fromTypedef) {
       this.next(); // struct | class
       const nameTok = this.eat("ident");
+
+      // Inheritance. Only the first base is modelled; multiple inheritance is
+      // out of scope and would change how method lookup works.
+      let base = null;
+      if (this.atOp(":")) {
+        this.next();
+        do {
+          this.eat("kw", "public");
+          this.eat("kw", "private");
+          this.eat("kw", "protected");
+          this.eat("kw", "virtual");
+          const b = this.eat("ident");
+          if (b && !base) base = b.value;
+        } while (this.eat("op", ","));
+      }
+
+      // Register the name before the body is parsed, so members can refer to
+      // the type being defined (a Widget* inside Widget, say).
+      if (nameTok) this.knownTypes.add(nameTok.value);
+
       if (!this.atOp("{")) {
-        // A forward declaration or a `struct Foo bar;` style variable.
-        if (nameTok) this.knownTypes.add(nameTok.value);
+        // A forward declaration, or a `struct Foo bar;` style variable.
         return null;
       }
       this.expect("op", "{");
+
+      const className = nameTok ? nameTok.value : null;
       const members = [];
+      const methods = [];
+      let ctor = null;
+
       while (!this.atOp("}") && !this.at("eof")) {
         if (this.atKw("public") || this.atKw("private") || this.atKw("protected")) {
           this.next();
@@ -188,11 +212,14 @@
           continue;
         }
         if (this.eat("op", ";")) continue;
-        const d = this.parseDeclaration(false);
-        if (d) members.push(d);
+
+        const member = this.parseMember(className);
+        if (!member) continue;
+        if (member.type === "CtorDecl") ctor = member;
+        else if (member.type === "FuncDecl") methods.push(member);
+        else members.push(member);
       }
       this.expect("op", "}");
-      if (nameTok) this.knownTypes.add(nameTok.value);
 
       // `struct Point { ... } origin;` also declares a variable.
       const vars = [];
@@ -205,10 +232,73 @@
 
       return {
         type: "StructDecl",
-        name: nameTok ? nameTok.value : null,
+        name: className,
+        base,
         members,
+        methods,
+        ctor,
         vars,
       };
+    }
+
+    /*
+     * One entry inside a class body: a constructor, a destructor, a method
+     * (inline, declared-only, or pure virtual), or a data member.
+     */
+    parseMember(className) {
+      // Destructor. Nothing here owns memory, so the body is parsed and dropped.
+      if (this.atOp("~")) {
+        this.next();
+        this.eat("ident");
+        this.parseParams();
+        this.eat("kw", "override");
+        if (this.atOp("{")) this.parseBlock();
+        else this.eat("op", ";");
+        return null;
+      }
+
+      // Constructor: the member's name is the class name, followed by '('.
+      const t = this.peek();
+      if (
+        className &&
+        (t.type === "ident" || t.type === "kw") &&
+        t.value === className &&
+        this.peek(1).type === "op" &&
+        this.peek(1).value === "("
+      ) {
+        this.next();
+        const params = this.parseParams();
+        const inits = this.parseMemberInitList();
+        let body = null;
+        if (this.atOp("{")) body = this.parseBlock();
+        else this.eat("op", ";");
+        return { type: "CtorDecl", name: className, params, inits, body, line: t.line };
+      }
+
+      return this.parseDeclaration(false, true);
+    }
+
+    // `: display(d), count(0)` between a constructor's parameters and its body.
+    parseMemberInitList() {
+      const inits = [];
+      if (!this.atOp(":")) return inits;
+      this.next();
+      do {
+        const name = this.peek();
+        if (name.type !== "ident" && name.type !== "kw") break;
+        this.next();
+        const args = [];
+        if (this.eat("op", "(") ) {
+          if (!this.atOp(")")) {
+            do { args.push(this.parseAssignment()); } while (this.eat("op", ","));
+          }
+          this.expect("op", ")");
+        } else if (this.atOp("{")) {
+          args.push(this.parseInitList());
+        }
+        inits.push({ name: name.value, args, line: name.line });
+      } while (this.eat("op", ","));
+      return inits;
     }
 
     /* ---------------- types ---------------- */
@@ -318,7 +408,7 @@
 
     /* ---------------- declarations ---------------- */
 
-    parseDeclaration(topLevel) {
+    parseDeclaration(topLevel, inClass) {
       const startTok = this.peek();
 
       if (this.atKw("struct") || this.atKw("class")) {
@@ -328,6 +418,30 @@
         this.pos = saved;
       }
       if (this.atKw("enum")) return this.parseEnum();
+
+      // An out-of-line constructor has no return type to parse first:
+      //   WidgetHost::WidgetHost(Adafruit_SSD1306 &d) : display(d) { ... }
+      if (
+        this.peek().type === "ident" &&
+        this.knownTypes.has(this.peek().value) &&
+        this.peek(1).type === "op" &&
+        this.peek(1).value === "::" &&
+        this.peek(2).type === "ident" &&
+        this.peek(2).value === this.peek().value
+      ) {
+        const owner = this.next().value;
+        this.next(); // ::
+        this.next(); // name
+        const params = this.parseParams();
+        const inits = this.parseMemberInitList();
+        const body = this.atOp("{") ? this.parseBlock() : (this.eat("op", ";"), null);
+        return {
+          type: "MethodDef",
+          className: owner,
+          decl: { type: "CtorDecl", name: owner, params, inits, body, line: startTok.line },
+          line: startTok.line,
+        };
+      }
 
       const spec = this.parseTypeSpec();
       if (!spec) {
@@ -354,26 +468,64 @@
           );
         }
         this.next();
-        const name = nameTok.value;
+        let name = nameTok.value;
 
-        // Function definition or prototype.
-        if (this.atOp("(") && this.isFunctionDeclarator(spec)) {
+        // `void WidgetHost::tick() { ... }` defines a method declared earlier.
+        let ownerClass = null;
+        if (this.atOp("::")) {
+          this.next();
+          ownerClass = name;
+          const memberTok = this.peek();
+          if (memberTok.type !== "ident" && memberTok.type !== "kw") {
+            throw new CompileError(
+              "Expected a member name after '" + ownerClass + "::'",
+              memberTok.line,
+              memberTok.col
+            );
+          }
+          this.next();
+          name = memberTok.value;
+        }
+
+        // Function definition, prototype, or pure virtual.
+        if (this.atOp("(") && (ownerClass || this.isFunctionDeclarator(spec))) {
           const params = this.parseParams();
           this.eat("kw", "const");
-          if (this.atOp("{")) {
-            const body = this.parseBlock();
-            return {
-              type: "FuncDecl",
-              name,
-              retType: spec,
-              params,
-              body,
-              line: startTok.line,
-            };
+          this.eat("kw", "override");
+          this.eat("kw", "final");
+
+          // `= 0` marks a pure virtual: declared, deliberately not defined.
+          let pure = false;
+          if (this.atOp("=")) {
+            this.next();
+            this.eat("num");
+            pure = true;
           }
-          this.eat("op", ";");
-          this.prototypes.add(name);
-          return null; // prototype carries no behaviour
+
+          const fn = {
+            type: "FuncDecl",
+            name,
+            retType: spec,
+            params,
+            body: null,
+            pure,
+            line: startTok.line,
+          };
+
+          if (this.atOp("{")) {
+            fn.body = this.parseBlock();
+          } else {
+            this.eat("op", ";");
+            if (!inClass && !ownerClass) {
+              this.prototypes.add(name);
+              return null; // a free-function prototype carries no behaviour
+            }
+          }
+
+          if (ownerClass) {
+            return { type: "MethodDef", className: ownerClass, decl: fn, line: startTok.line };
+          }
+          return fn;
         }
 
         const decl = {
@@ -726,10 +878,17 @@
         }
         return { type: "Sizeof", arg: this.parseUnary(), line: t.line };
       }
+      if (t.type === "kw" && t.value === "delete") {
+        this.next();
+        if (this.eat("op", "[")) this.expect("op", "]");
+        const arg = this.parseUnary();
+        // Nothing here is reclaimed; a sketch runs for one session.
+        return { type: "Delete", arg, line: t.line };
+      }
       if (t.type === "kw" && t.value === "new") {
         this.next();
         const spec = this.parseTypeSpec();
-        let args = [];
+        const args = [];
         if (this.atOp("(")) {
           this.next();
           if (!this.atOp(")")) {
@@ -829,6 +988,10 @@
         this.next();
         return { type: "Bool", value: t.value === "true", line: t.line };
       }
+      if (t.type === "kw" && t.value === "this") {
+        this.next();
+        return { type: "This", line: t.line };
+      }
       if (t.type === "ident") {
         this.next();
         return { type: "Ident", name: t.value, line: t.line };
@@ -860,12 +1023,14 @@
     return "'" + t.value + "'";
   }
 
-  function parse(source) {
-    const lexed = lexer.lex(source);
+  function parse(source, options) {
+    const lexed = lexer.lex(source, options);
     const p = new Parser(lexed.tokens);
     const program = p.parseProgram();
     program.includes = lexed.includes;
     program.defines = lexed.defines;
+    program.lineMap = lexed.lineMap;
+    program.flattened = lexed.flattened;
     return program;
   }
 

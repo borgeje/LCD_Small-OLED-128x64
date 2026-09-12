@@ -288,6 +288,7 @@
     const key = pins.join(",");
     if (key === knownPins) {
       for (const pin of pins) {
+        if (!sketch.interp.io.analogPins.has(pin)) continue;
         const out = document.getElementById("io-val-" + pin);
         if (out && document.activeElement !== document.getElementById("io-in-" + pin)) {
           const v = sketch.interp.io.analog[pin];
@@ -305,35 +306,65 @@
     }
     el.ioNote.textContent = pins.length + (pins.length === 1 ? " pin" : " pins");
 
+    // A pin read only with digitalRead() gets a switch, not a 0-4095 slider:
+    // a button is a button, and the pull-up default has to be visible.
+    const isAnalog = (pin) => sketch.interp.io.analogPins.has(pin);
+
     el.io.innerHTML = pins
       .map((pin) => {
-        const v = ioValues[pin] !== undefined ? ioValues[pin] : 0;
+        if (isAnalog(pin)) {
+          const v = ioValues[pin] !== undefined ? ioValues[pin] : 0;
+          return (
+            '<div class="io-row">' +
+            '<div class="name">GPIO ' + pin + "</div>" +
+            '<input type="range" id="io-in-' + pin + '" min="0" max="4095" value="' + v + '">' +
+            '<div class="val" id="io-val-' + pin + '">' + v + "</div>" +
+            "</div>"
+          );
+        }
+        const pulledUp = sketch.interp.io.pinModes[pin] === 2;
+        const level = ioValues[pin] !== undefined ? ioValues[pin] : (pulledUp ? 1 : 0);
         return (
           '<div class="io-row">' +
           '<div class="name">GPIO ' + pin + "</div>" +
-          '<input type="range" id="io-in-' + pin + '" min="0" max="4095" value="' + v + '">' +
-          '<div class="val" id="io-val-' + pin + '">' + v + "</div>" +
+          '<button id="io-in-' + pin + '" class="io-toggle">' +
+          (level ? "HIGH" : "LOW") + (pulledUp ? " · pull-up" : "") + "</button>" +
+          '<div class="val" id="io-val-' + pin + '">' + level + "</div>" +
           "</div>"
         );
       })
       .join("");
 
+    const nudge = () => {
+      if (!running) {
+        advance({ stopOnFrame: true, wallMs: 60 });
+        paintScreen();
+        paintStats();
+      }
+    };
+
     for (const pin of pins) {
       const input = document.getElementById("io-in-" + pin);
-      input.addEventListener("input", () => {
-        const v = parseInt(input.value, 10);
-        ioValues[pin] = v;
-        document.getElementById("io-val-" + pin).textContent = v;
-        if (sketch) {
-          sketch.interp.io.analog[pin] = v;
-          sketch.interp.io.digital[pin] = v > 2047 ? 1 : 0;
-        }
-        if (!running) {
-          advance({ stopOnFrame: true, wallMs: 60 });
-          paintScreen();
-          paintStats();
-        }
-      });
+      if (isAnalog(pin)) {
+        input.addEventListener("input", () => {
+          const v = parseInt(input.value, 10);
+          ioValues[pin] = v;
+          document.getElementById("io-val-" + pin).textContent = v;
+          if (sketch) sketch.interp.io.analog[pin] = v;
+          nudge();
+        });
+      } else {
+        input.addEventListener("click", () => {
+          const pulledUp = sketch.interp.io.pinModes[pin] === 2;
+          const current = ioValues[pin] !== undefined ? ioValues[pin] : (pulledUp ? 1 : 0);
+          const next = current ? 0 : 1;
+          ioValues[pin] = next;
+          input.textContent = (next ? "HIGH" : "LOW") + (pulledUp ? " · pull-up" : "");
+          document.getElementById("io-val-" + pin).textContent = next;
+          if (sketch) sketch.interp.io.digital[pin] = next;
+          nudge();
+        });
+      }
     }
   }
 

@@ -148,12 +148,35 @@ function main() {
   }
 
   const source = fs.readFileSync(opts.sketch, "utf8");
+  const sketchDir = path.dirname(path.resolve(opts.sketch));
+
+  /*
+   * Local `#include "x.h"` is resolved against the sketch folder, then its
+   * parent (so a project can keep headers in a subdirectory next to the .ino),
+   * which is enough for an Arduino-shaped project without pulling in a real
+   * build system.
+   */
+  const resolveInclude = (name) => {
+    const candidates = [
+      path.resolve(sketchDir, name),
+      path.resolve(sketchDir, "..", name),
+    ];
+    for (const file of candidates) {
+      if (fs.existsSync(file) && fs.statSync(file).isFile()) {
+        return { source: fs.readFileSync(file, "utf8"), path: path.relative(sketchDir, file) || path.basename(file) };
+      }
+    }
+    return null;
+  };
 
   let sketch;
   try {
-    sketch = new Sketch(source);
+    sketch = new Sketch(source, {
+      resolveInclude,
+      fileName: path.basename(opts.sketch),
+    });
   } catch (e) {
-    reportError(e, opts.sketch, source);
+    reportError(e, opts.sketch, source, null);
     process.exit(1);
   }
 
@@ -178,7 +201,7 @@ function main() {
     result = advanceTo(target);
 
     if (sketch.error) {
-      reportError(sketch.error, opts.sketch, source);
+      reportError(sketch.error, opts.sketch, source, sketch);
       process.exit(1);
     }
     const snap = sketch.snapshot();
@@ -249,17 +272,29 @@ function main() {
   }
 }
 
-function reportError(e, file, source) {
-  const where = e.line ? file + ":" + e.line : file;
-  console.error("\n" + (e.name || "Error") + " in " + where);
+function reportError(e, file, source, sketch) {
+  // With headers inlined, e.line indexes the flattened source; the sketch can
+  // map it back to the file the author actually wrote.
+  const where = sketch && e.file ? e.file : path.basename(file);
+  const lineNo = sketch && e.sourceLine !== undefined ? e.sourceLine : e.line;
+
+  console.error("\n" + (e.name || "Error") + " in " + (lineNo ? where + ":" + lineNo : where));
   console.error("  " + e.message);
-  if (e.line && source) {
-    const lines = source.split("\n");
-    const start = Math.max(0, e.line - 3);
-    const end = Math.min(lines.length, e.line + 2);
+
+  let text = source;
+  if (sketch && e.file && e.file !== path.basename(file)) {
+    const candidate = path.resolve(path.dirname(path.resolve(file)), e.file);
+    if (fs.existsSync(candidate)) text = fs.readFileSync(candidate, "utf8");
+    else text = null;
+  }
+
+  if (lineNo && text) {
+    const lines = text.split("\n");
+    const start = Math.max(0, lineNo - 3);
+    const end = Math.min(lines.length, lineNo + 2);
     console.error("");
     for (let i = start; i < end; i++) {
-      const marker = i + 1 === e.line ? " >" : "  ";
+      const marker = i + 1 === lineNo ? " >" : "  ";
       console.error(marker + String(i + 1).padStart(4) + " | " + lines[i]);
     }
   }

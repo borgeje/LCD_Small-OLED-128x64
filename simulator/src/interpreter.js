@@ -158,6 +158,10 @@
 
   function cloneValue(value) {
     if (!value) return value;
+    // Instances are handled as references throughout: `Widget *w = x` is the
+    // shape real firmware uses, and silently copying a polymorphic object
+    // would be the wrong answer far more often than the right one.
+    if (value.t === "instance") return value;
     if (value.t === "struct") {
       const fields = {};
       for (const k of Object.keys(value.fields)) {
@@ -205,7 +209,11 @@
       this.global = new Scope(null);
       this.functions = new Map();
       this.structs = new Map();
+      this.classes = new Map();
       this.staticCells = new Map();
+      // The receiver of the method currently executing, so a method can call
+      // a sibling method without writing `this->`.
+      this.thisStack = [];
 
       this.micros = 0; // virtual clock, microseconds
       this.steps = 0;
@@ -222,7 +230,9 @@
         analog: {},
         digital: {},
         pinModes: {},
-        pinsRead: new Set(),
+        pinsRead: new Set(),      // union, for callers that just want "used"
+        analogPins: new Set(),    // read via analogRead -> needs a slider
+        digitalPins: new Set(),   // read via digitalRead -> needs a switch
         pinsWritten: new Set(),
       };
       this.randomState = 12345;
@@ -280,11 +290,213 @@
 
     load(program) {
       this.program = program;
+
       for (const decl of program.decls) {
-        if (decl.type === "FuncDecl") this.functions.set(decl.name, decl);
-        else if (decl.type === "StructDecl" && decl.name) this.structs.set(decl.name, decl);
+        if (decl.type === "FuncDecl") {
+          this.functions.set(decl.name, decl);
+        } else if (decl.type === "StructDecl" && decl.name) {
+          this.structs.set(decl.name, decl);
+          this.classes.set(decl.name, {
+            name: decl.name,
+            base: decl.base || null,
+            members: decl.members || [],
+            methods: new Map((decl.methods || []).map((m) => [m.name, m])),
+            ctor: decl.ctor || null,
+          });
+        }
       }
+
+      // A second pass, because `void Foo::bar() {}` may appear before or
+      // after the class body that declared bar.
+      for (const decl of program.decls) {
+        if (decl.type !== "MethodDef") continue;
+        const cls = this.classes.get(decl.className);
+        if (!cls) {
+          throw new RuntimeError(
+            "'" + decl.className + "::" + decl.decl.name +
+              "' has no matching class declaration",
+            decl.line
+          );
+        }
+        if (decl.decl.type === "CtorDecl") cls.ctor = decl.decl;
+        else cls.methods.set(decl.decl.name, decl.decl);
+      }
+
       return this;
+    }
+
+    /* ---- classes ---- */
+
+    classChain(className) {
+      const chain = [];
+      const seen = new Set();
+      let name = className;
+      while (name && this.classes.has(name) && !seen.has(name)) {
+        seen.add(name);
+        chain.unshift(this.classes.get(name));
+        name = this.classes.get(name).base;
+      }
+      return chain;
+    }
+
+    findMethod(className, methodName) {
+      const chain = this.classChain(className);
+      // Most-derived wins, which is what makes every call dynamically bound.
+      for (let i = chain.length - 1; i >= 0; i--) {
+        const m = chain[i].methods.get(methodName);
+        if (m) return m;
+      }
+      return null;
+    }
+
+    *instantiate(className, args, line, depth) {
+      depth = depth || 0;
+      if (depth > 8) {
+        throw new RuntimeError(
+          "'" + className + "' contains itself by value - use a pointer", line
+        );
+      }
+      const chain = this.classChain(className);
+      if (!chain.length) {
+        throw new RuntimeError("'" + className + "' is not a known class", line);
+      }
+
+      const inst = { t: "instance", className, fields: {} };
+
+      // Data members, base class first, so a derived field of the same name
+      // ends up on top the way C++ shadowing does.
+      for (const cls of chain) {
+        for (const m of cls.members) {
+          if (m.type !== "VarDecl") continue;
+          for (const d of m.declarators) {
+            let value;
+            if (d.arrayDims.length) {
+              const dims = [];
+              for (const dim of d.arrayDims) {
+                dims.push(dim ? Math.trunc(asNumber(yield* this.evalExpr(dim, this.global))) : 0);
+              }
+              value = d.init && d.init.type === "InitList"
+                ? yield* this.buildArrayFromInit(d.init, dims, m.spec, this.global)
+                : this.makeArray(dims, m.spec);
+            } else if (d.init) {
+              value = coerce(yield* this.evalExpr(d.init, this.global), m.spec);
+            } else if (!m.spec.pointer && !d.pointer && this.classes.has(m.spec.base)) {
+              value = yield* this.instantiate(m.spec.base, [], line, depth + 1);
+            } else {
+              value = this.defaultValue(m.spec, d.pointer);
+            }
+            inst.fields[d.name] = { v: value, spec: m.spec };
+          }
+        }
+      }
+
+      yield* this.runCtor(inst, chain[chain.length - 1], args, line);
+      return inst;
+    }
+
+    *runCtor(inst, cls, args, line) {
+      const ctor = cls.ctor;
+
+      if (!ctor) {
+        if (cls.base && this.classes.has(cls.base)) {
+          yield* this.runCtor(inst, this.classes.get(cls.base), [], line);
+        }
+        return;
+      }
+
+      // One scope for both the member-initialiser list and the body: an
+      // initialiser like `: display(display)` has to see the parameter, and a
+      // parameter that shares a field's name must shadow it, exactly as in C++.
+      const scope = this.makeReceiverScope(inst);
+      yield* this.bindParams(scope, ctor.params, args);
+
+      let baseDone = false;
+      for (const init of ctor.inits || []) {
+        if (cls.base && init.name === cls.base) {
+          const baseArgs = [];
+          for (const a of init.args) baseArgs.push(yield* this.evalExpr(a, scope));
+          yield* this.runCtor(inst, this.classes.get(cls.base), baseArgs, line);
+          baseDone = true;
+          continue;
+        }
+        const cell = inst.fields[init.name];
+        if (!cell) {
+          throw new RuntimeError(
+            "'" + init.name + "' is not a member of " + cls.name, init.line || line
+          );
+        }
+        if (init.args.length) {
+          cell.v = coerce(yield* this.evalExpr(init.args[0], scope), cell.spec);
+        }
+      }
+      if (!baseDone && cls.base && this.classes.has(cls.base)) {
+        yield* this.runCtor(inst, this.classes.get(cls.base), [], line);
+      }
+
+      if (ctor.body) {
+        this.thisStack.push(inst);
+        try {
+          yield* this.execBlock(ctor.body, scope);
+        } finally {
+          this.thisStack.pop();
+        }
+      }
+    }
+
+    // A scope in which the receiver's fields are visible as bare names.
+    makeReceiverScope(inst) {
+      const scope = new Scope(this.global);
+      for (const name of Object.keys(inst.fields)) {
+        scope.declare(name, inst.fields[name]);
+      }
+      scope.declare("this", {
+        v: { t: "ptr", ref: { get: () => inst, set: () => {} } },
+        spec: { base: inst.className, pointer: 1 },
+      });
+      return scope;
+    }
+
+    *bindParams(scope, params, argValues) {
+      for (let i = 0; i < params.length; i++) {
+        const p = params[i];
+        if (!p.name || p.variadic) continue;
+        let v = argValues[i];
+        if (v === undefined) {
+          v = p.defaultValue ? yield* this.evalExpr(p.defaultValue, scope) : num(0, false);
+        }
+        if (
+          p.reference || p.pointer > 0 ||
+          (v && (v.t === "arr" || v.t === "obj" || v.t === "ptr" || v.t === "instance"))
+        ) {
+          scope.declare(p.name, { v, spec: p.spec, byRef: true });
+        } else {
+          scope.declare(p.name, { v: coerce(cloneValue(v), p.spec), spec: p.spec });
+        }
+      }
+    }
+
+    *callMethod(inst, decl, args) {
+      if (decl.pure || !decl.body) {
+        throw new RuntimeError(
+          "'" + inst.className + "::" + decl.name + "()' is declared but never defined" +
+            (decl.pure ? " (it is pure virtual - override it in the subclass)" : ""),
+          decl.line
+        );
+      }
+      const scope = this.makeReceiverScope(inst);
+      yield* this.bindParams(scope, decl.params, args);
+
+      this.thisStack.push(inst);
+      let sig;
+      try {
+        sig = yield* this.execBlock(decl.body, scope);
+      } finally {
+        this.thisStack.pop();
+      }
+      if (sig && sig.sig === "return") {
+        return sig.value === undefined ? VOID : coerce(sig.value, decl.retType);
+      }
+      return VOID;
     }
 
     *initGlobals() {
@@ -293,10 +505,10 @@
         else if (decl.type === "EnumDecl") this.declareEnum(decl, this.global);
         else if (decl.type === "StructDecl") {
           for (const vname of decl.vars || []) {
-            this.global.declare(vname, {
-              v: this.makeStruct(decl.name),
-              spec: { base: decl.name },
-            });
+            const v = this.classes.has(decl.name)
+              ? yield* this.instantiate(decl.name, [], decl.line || 0)
+              : this.makeStruct(decl.name);
+            this.global.declare(vname, { v, spec: { base: decl.name } });
           }
         }
       }
@@ -326,23 +538,9 @@
     }
 
     *callFunction(decl, argValues) {
+      // Arrays, objects and references alias; everything else copies.
       const scope = new Scope(this.global);
-      for (let i = 0; i < decl.params.length; i++) {
-        const p = decl.params[i];
-        if (!p.name || p.variadic) continue;
-        let v = argValues[i];
-        if (v === undefined) {
-          v = p.defaultValue
-            ? yield* this.evalExpr(p.defaultValue, scope)
-            : num(0, false);
-        }
-        // Arrays and references alias; everything else copies.
-        if (p.reference || p.pointer > 0 || (v && (v.t === "arr" || v.t === "obj" || v.t === "ptr"))) {
-          scope.declare(p.name, { v, spec: p.spec, byRef: true });
-        } else {
-          scope.declare(p.name, { v: coerce(cloneValue(v), p.spec), spec: p.spec });
-        }
-      }
+      yield* this.bindParams(scope, decl.params, argValues);
 
       const sig = yield* this.execBlock(decl.body, scope);
       if (sig && sig.sig === "return") {
@@ -519,9 +717,12 @@
       return { t: "struct", name, fields };
     }
 
-    defaultValue(spec) {
+    defaultValue(spec, declaratorPointer) {
+      // A pointer starts null, which is 0 here, so `if (p)` behaves.
+      if ((spec && spec.pointer > 0) || declaratorPointer > 0) return num(0, false);
       const info = specInfo(spec);
       if (info.str) return str("");
+      if (info.object && this.classes.has(spec.base)) return VOID; // built by instantiate()
       if (info.object && this.structs.has(spec.base)) return this.makeStruct(spec.base);
       if (info.object) return VOID;
       if (info.int === false) return num(0, true);
@@ -555,7 +756,15 @@
         if (d.ctorArgs) {
           const args = [];
           for (const a of d.ctorArgs) args.push(yield* this.evalExpr(a, scope));
-          value = this.construct(decl.spec.base, args, d.line);
+          value = this.classes.has(decl.spec.base)
+            ? yield* this.instantiate(decl.spec.base, args, d.line)
+            : this.construct(decl.spec.base, args, d.line);
+        } else if (
+          !d.arrayDims.length && !d.init && !d.pointer && !decl.spec.pointer &&
+          this.classes.has(decl.spec.base)
+        ) {
+          // `WidgetHost host;` - default-construct it.
+          value = yield* this.instantiate(decl.spec.base, [], d.line);
         } else if (d.arrayDims.length) {
           const dims = [];
           for (const dim of d.arrayDims) {
@@ -587,7 +796,7 @@
             value = coerce(cloneValue(v), decl.spec);
           }
         } else {
-          value = this.defaultValue(decl.spec);
+          value = this.defaultValue(decl.spec, d.pointer);
         }
 
         const cell = { v: value, spec: decl.spec };
@@ -798,8 +1007,27 @@
         }
 
         case "New": {
-          return this.construct(node.spec.base, [], node.line);
+          const args = [];
+          for (const a of node.args || []) args.push(yield* this.evalExpr(a, scope));
+          if (this.classes.has(node.spec.base)) {
+            return yield* this.instantiate(node.spec.base, args, node.line);
+          }
+          return this.construct(node.spec.base, args, node.line);
         }
+
+        case "This": {
+          const inst = this.thisStack[this.thisStack.length - 1];
+          if (!inst) {
+            throw new RuntimeError("'this' is only valid inside a method", node.line);
+          }
+          return { t: "ptr", ref: { get: () => inst, set: () => {} } };
+        }
+
+        case "Delete":
+          // Accepted so ordinary C++ runs; the sketch owns memory for one
+          // session and nothing here is reclaimed.
+          yield* this.evalExpr(node.arg, scope);
+          return VOID;
         case "NewArray": {
           const size = Math.trunc(asNumber(yield* this.evalExpr(node.size, scope)));
           return this.makeArray([size], node.spec);
@@ -911,6 +1139,21 @@
         case "Member": {
           let obj = yield* this.evalExpr(node.obj, scope);
           if (obj.t === "ptr" && obj.ref) obj = obj.ref.get();
+          if (obj.t === "instance") {
+            let cell = obj.fields[node.prop];
+            if (!cell) {
+              throw new RuntimeError(
+                "'" + node.prop + "' is not a member of " + obj.className, node.line
+              );
+            }
+            return {
+              spec: cell.spec,
+              get: () => cell.v,
+              set: (v) => {
+                cell.v = v;
+              },
+            };
+          }
           if (obj.t === "struct") {
             let cell = obj.fields[node.prop];
             if (!cell) {
@@ -960,6 +1203,16 @@
     *memberValue(obj, prop, node) {
       if (obj && obj.t === "ptr" && obj.ref) obj = obj.ref.get();
 
+      if (obj && obj.t === "instance") {
+        const cell = obj.fields[prop];
+        if (cell) return cell.v;
+        const method = this.findMethod(obj.className, prop);
+        if (method) return { t: "boundmethod", inst: obj, decl: method };
+        throw new RuntimeError(
+          "'" + prop + "' is not a member of " + obj.className, node.line
+        );
+      }
+
       if (obj && obj.t === "struct") {
         const cell = obj.fields[prop];
         if (cell) return cell.v;
@@ -992,6 +1245,18 @@
         if (obj.t === "ptr" && obj.ref) obj = obj.ref.get();
         const args = [];
         for (const a of node.args) args.push(yield* this.evalExpr(a, scope));
+
+        if (obj.t === "instance") {
+          const method = this.findMethod(obj.className, callee.prop);
+          if (!method) {
+            throw new RuntimeError(
+              "'" + callee.prop + "()' is not a method of " + obj.className +
+                (obj.className === callee.prop ? "" : ""),
+              node.line
+            );
+          }
+          return yield* this.callMethod(obj, method, args);
+        }
 
         if (obj.t === "obj") {
           const host = obj.obj;
@@ -1035,6 +1300,23 @@
           const args = [];
           for (const a of node.args) args.push(yield* this.evalExpr(a, scope));
           return yield* this.callFunction(cell.v.decl, args);
+        }
+
+        if (cell && cell.v && cell.v.t === "boundmethod") {
+          const args = [];
+          for (const a of node.args) args.push(yield* this.evalExpr(a, scope));
+          return yield* this.callMethod(cell.v.inst, cell.v.decl, args);
+        }
+
+        // Inside a method, an unqualified call resolves against the receiver.
+        const receiver = this.thisStack[this.thisStack.length - 1];
+        if (receiver) {
+          const method = this.findMethod(receiver.className, name);
+          if (method) {
+            const args = [];
+            for (const a of node.args) args.push(yield* this.evalExpr(a, scope));
+            return yield* this.callMethod(receiver, method, args);
+          }
         }
 
         throw new RuntimeError(this.explainUnknown(name, "call"), node.line);
