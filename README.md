@@ -7,6 +7,8 @@ Project to test and deploy an initial simple project on this small OLED display:
 
 Full reference: [`docs/hosyond-0.96in-oled-ssd1306-128x64.md`](docs/hosyond-0.96in-oled-ssd1306-128x64.md)
 
+Example on AMAZON to buy: https://www.amazon.com/dp/B09T6SJBV5?ref_=ppx_hzsearch_conn_dt_b_fed_asin_title_8&th=1
+
 ## Try a sketch without the hardware
 
 [`simulator/`](simulator/README.md) runs an `.ino` file and shows you what this
